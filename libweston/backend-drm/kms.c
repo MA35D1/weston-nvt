@@ -105,6 +105,7 @@ const struct drm_property_info plane_props[] = {
 		.num_enum_values = WDRM_PLANE_ROTATION__COUNT,
 	 },
 	[WDRM_PLANE_ALPHA] = { .name = "alpha" },
+	[WDRM_PLANE_DTRC_META] = { .name = "dtrc_table_ofs" },
 };
 
 struct drm_property_enum_info dpms_state_enums[] = {
@@ -619,7 +620,7 @@ fallback:
 							 kplane->formats[i]);
 		if (!fmt)
 			return -1;
-		ret = weston_drm_format_add_modifier(fmt, DRM_FORMAT_MOD_INVALID);
+		ret = weston_drm_format_add_modifier(fmt, DRM_FORMAT_MOD_LINEAR);
 		if (ret < 0)
 			return -1;
 	}
@@ -863,14 +864,8 @@ drm_output_apply_state_legacy(struct drm_output_state *state)
 	 * legacy PageFlip API doesn't allow us to do clipping either. */
 	assert(scanout_state->src_x == 0);
 	assert(scanout_state->src_y == 0);
-	assert(scanout_state->src_w ==
-		(unsigned) (output->base.current_mode->width << 16));
-	assert(scanout_state->src_h ==
-		(unsigned) (output->base.current_mode->height << 16));
 	assert(scanout_state->dest_x == 0);
 	assert(scanout_state->dest_y == 0);
-	assert(scanout_state->dest_w == scanout_state->src_w >> 16);
-	assert(scanout_state->dest_h == scanout_state->src_h >> 16);
 	/* The legacy SetCrtc API doesn't support fences */
 	assert(scanout_state->in_fence_fd == -1);
 
@@ -1076,6 +1071,28 @@ get_drm_protection_from_weston(enum weston_hdcp_protection weston_protection,
 	}
 }
 
+static int
+drm_protection_from_weston_update(enum weston_hdcp_protection protection)
+{
+	enum weston_hdcp_protection current_protection;
+	static enum weston_hdcp_protection op_protection;
+	static bool op_protection_valid = false;
+
+	current_protection = protection;
+
+	if (!op_protection_valid) {
+		op_protection = current_protection;
+		op_protection_valid = true;
+	}
+
+	if (current_protection != op_protection) {
+		op_protection = current_protection;
+		return 1;
+	}
+
+	return 0;
+}
+
 static void
 drm_connector_set_hdcp_property(struct drm_connector *connector,
 				enum weston_hdcp_protection protection,
@@ -1214,6 +1231,22 @@ drm_output_apply_state_atomic(struct drm_output_state *state,
 	enum writeback_screenshot_state wb_screenshot_state =
 		drm_output_get_writeback_state(output);
 	int ret = 0;
+	int in_fence_fd = -1;
+	int update = 0;
+
+	if(output->gbm_surface) {
+		/* in_fence_fd was not created when
+		 * the buffer_release was not exist or
+		 * the buffer was not used in the output.
+		 */
+		if (output->surface_get_in_fence_fd)
+			in_fence_fd = output->surface_get_in_fence_fd(output->gbm_surface);
+	}
+#if defined(ENABLE_IMXG2D)
+	else if(b->use_g2d && b->g2d_renderer) {
+		in_fence_fd = b->g2d_renderer->get_surface_fence_fd(&output->g2d_image[output->current_image]);
+	}
+#endif
 
 	drm_debug(b, "\t\t[atomic] %s output %lu (%s) state\n",
 		  (*flags & DRM_MODE_ATOMIC_TEST_ONLY) ? "testing" : "applying",
@@ -1268,6 +1301,17 @@ drm_output_apply_state_atomic(struct drm_output_state *state,
 			if (!(*flags & DRM_MODE_ATOMIC_TEST_ONLY))
 				wb_state->state = DRM_OUTPUT_WB_SCREENSHOT_CHECK_FENCE;
 		}
+
+		if (device->hdr_blob_id > 0) {
+			wl_list_for_each(head, &output->base.head_list, base.output_link) {
+				/* checking if the output driver this head */
+				if (head->base.output == &output->base) {
+					connector_add_prop(req, &head->connector, WDRM_CONNECTOR_HDR_OUTPUT_METADATA,
+							device->hdr_blob_id);
+					*flags |= DRM_MODE_ATOMIC_ALLOW_MODESET;
+				}
+			}
+		}
 	} else {
 		ret |= crtc_add_prop(req, crtc, WDRM_CRTC_MODE_ID, 0);
 		ret |= crtc_add_prop(req, crtc, WDRM_CRTC_ACTIVE, 0);
@@ -1293,16 +1337,25 @@ drm_output_apply_state_atomic(struct drm_output_state *state,
 	}
 
 	wl_list_for_each(head, &output->base.head_list, base.output_link) {
-		drm_connector_set_hdcp_property(&head->connector,
-						state->protection, req);
+		update = drm_protection_from_weston_update(state->protection);
+		if(update) {
+			drm_connector_set_hdcp_property(&head->connector,
+							state->protection, req);
+			/* checking if the output driver this head */
+			if (head->base.output == &output->base) {
+				*flags |= DRM_MODE_ATOMIC_ALLOW_MODESET;
+			}
+		}
+
 		ret |= drm_connector_set_content_type(&head->connector,
 						      output->content_type, req);
 
 		if (drm_connector_has_prop(&head->connector,
-					   WDRM_CONNECTOR_HDR_OUTPUT_METADATA)) {
+					   WDRM_CONNECTOR_HDR_OUTPUT_METADATA) && device->clean_hdr_blob) {
 			ret |= connector_add_prop(req, &head->connector,
 						  WDRM_CONNECTOR_HDR_OUTPUT_METADATA,
 						  output->hdr_output_metadata_blob_id);
+			*flags |= DRM_MODE_ATOMIC_ALLOW_MODESET;
 		}
 
 		ret |= drm_connector_set_max_bpc(&head->connector, output, req);
@@ -1354,6 +1407,10 @@ drm_output_apply_state_atomic(struct drm_output_state *state,
 			ret |= plane_add_prop(req, plane,
 					      WDRM_PLANE_IN_FENCE_FD,
 					      plane_state->in_fence_fd);
+		} else if (in_fence_fd >= 0 && plane->type == WDRM_PLANE_TYPE_PRIMARY && plane_state->fb) {
+			ret |= plane_add_prop(req, plane,
+					      WDRM_PLANE_IN_FENCE_FD,
+					      in_fence_fd);
 		}
 
 		if (plane->props[WDRM_PLANE_ROTATION].prop_id != 0)
@@ -1372,6 +1429,13 @@ drm_output_apply_state_atomic(struct drm_output_state *state,
 			ret |= plane_add_prop(req, plane,
 					      WDRM_PLANE_ALPHA,
 					      plane_state->alpha);
+
+		if (plane_state->fb && plane_state->fb->dtrc_meta != plane->dtrc_meta
+		    && plane->type == WDRM_PLANE_TYPE_OVERLAY
+			&& plane_state->fb->modifier != DRM_FORMAT_MOD_LINEAR) {
+		    plane_add_prop(req, plane, WDRM_PLANE_DTRC_META, plane_state->fb->dtrc_meta);
+		    plane->dtrc_meta = plane_state->fb->dtrc_meta;
+		}
 
 		if (ret != 0) {
 			weston_log("couldn't set plane state\n");
@@ -1410,6 +1474,7 @@ drm_pending_state_apply_atomic(struct drm_pending_state *pending_state,
 	uint32_t flags, tear_flag = 0;
 	bool may_tear = true;
 	int ret = 0;
+	drm_magic_t magic;
 
 	if (!req)
 		return -1;
@@ -1529,6 +1594,11 @@ drm_pending_state_apply_atomic(struct drm_pending_state *pending_state,
 	if (may_tear)
 		tear_flag = DRM_MODE_PAGE_FLIP_ASYNC;
 
+	/*drm master was set by systemd in PM test, try to set the master back.*/
+	if (!(drmGetMagic(device->drm.fd, &magic) == 0 &&
+			drmAuthMagic(device->drm.fd, magic) == 0)) {
+		drmSetMaster(device->drm.fd);
+	}
 	ret = drmModeAtomicCommit(device->drm.fd, req, flags | tear_flag,
 				  device);
 	drm_debug(b, "[atomic] drmModeAtomicCommit\n");
@@ -1564,10 +1634,15 @@ drm_pending_state_apply_atomic(struct drm_pending_state *pending_state,
 		drm_output_assign_state(output_state, mode);
 
 	device->state_invalid = false;
+	device->clean_hdr_blob = false;
 
 	assert(wl_list_empty(&pending_state->output_list));
 
 out:
+	if (device->hdr_blob_id > 0) {
+		drmModeDestroyPropertyBlob (device->drm.fd, device->hdr_blob_id);
+		device->hdr_blob_id = 0;
+	}
 	drmModeAtomicFree(req);
 	drm_pending_state_free(pending_state);
 	return ret;

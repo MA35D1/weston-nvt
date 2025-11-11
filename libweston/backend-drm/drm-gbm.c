@@ -300,6 +300,8 @@ drm_output_render_gl(struct drm_output_state *state, pixman_region32_t *damage)
 	struct drm_device *device = output->device;
 	struct gbm_bo *bo;
 	struct drm_fb *ret;
+	struct weston_paint_node *pnode;
+	bool have_through_hole = false;
 
 	output->base.compositor->renderer->repaint_output(&output->base,
 							  damage, NULL);
@@ -311,10 +313,17 @@ drm_output_render_gl(struct drm_output_state *state, pixman_region32_t *damage)
 		return NULL;
 	}
 
-	/* Output transparent/opaque image according to the format required by
-	 * the client. */
-	ret = drm_fb_get_from_bo(bo, device, !output->format->opaque_substitute,
-	                         BUFFER_GBM_SURFACE);
+	/* If there are through holes on the primary plane, the renderer needs to
+	 * produces a non-opaque image, otherwise an opaque image. */
+	wl_list_for_each_reverse(pnode, &output->base.paint_node_z_order_list,
+	                         z_order_link) {
+		if (pnode->need_hole) {
+			have_through_hole = true;
+			break;
+		}
+	}
+
+	ret = drm_fb_get_from_bo(bo, device, !have_through_hole, BUFFER_GBM_SURFACE);
 	if (!ret) {
 		weston_log("failed to get drm_fb for bo\n");
 		gbm_surface_release_buffer(output->gbm_surface, bo);
@@ -324,3 +333,165 @@ drm_output_render_gl(struct drm_output_state *state, pixman_region32_t *damage)
 
 	return ret;
 }
+
+#if defined(ENABLE_IMXG2D)
+static int
+drm_backend_create_g2d_renderer(struct drm_backend *b)
+{
+	if (b->g2d_renderer->drm_display_create(b->compositor,
+					(void *)b->gbm) < 0) {
+		return -1;
+	}
+
+	return 0;
+}
+
+int
+init_g2d(struct drm_backend *b)
+{
+	b->g2d_renderer = weston_load_module("g2d-renderer.so",
+						 "g2d_renderer_interface",
+						 LIBWESTON_MODULEDIR);
+	if (!b->g2d_renderer) {
+		weston_log("Could not load g2d renderer\n");
+		return -1;
+	}
+
+	struct drm_device *device = b->drm;
+
+	b->gbm = gbm_create_device(device->drm.fd);
+	if (!b->gbm)
+		return -1;
+
+	if (drm_backend_create_g2d_renderer(b) < 0) {
+		gbm_device_destroy(b->gbm);
+		return -1;
+	}
+
+	return 0;
+}
+
+int
+drm_output_init_g2d(struct drm_output *output, struct drm_backend *b)
+{
+	const struct weston_mode *mode = output->base.current_mode;
+	int w = output->base.current_mode->width;
+	int h = output->base.current_mode->height;
+	uint32_t format = output->format->format;
+	enum g2d_format g2dFormat;
+	uint32_t i = 0;
+	struct drm_device *device = b->drm;
+
+	switch (format) {
+		case DRM_FORMAT_XRGB8888:
+			g2dFormat = G2D_BGRX8888;
+			break;
+		case DRM_FORMAT_ARGB8888:
+			g2dFormat = G2D_BGRA8888;
+			break;
+		case DRM_FORMAT_RGB565:
+			g2dFormat = G2D_RGB565;
+			break;
+		default:
+			weston_log("Unsupported pixman format 0x%x\n", format);
+			return -1;
+	}
+
+	struct g2d_renderer_output_options options = {
+		.formats = output->format,
+		.formats_count = 1,
+		.area.x = 0,
+		.area.y = 0,
+		.area.width = mode->width,
+		.area.height = mode->height,
+		.fb_size.width = mode->width,
+		.fb_size.height = mode->height,
+	};
+
+	for (i = 0; i < ARRAY_LENGTH(output->dumb); i++) {
+		struct g2d_surfaceEx* g2dSurface = &(output->g2d_image[i]);
+		int ret;
+		output->dumb[i] = drm_fb_create_dumb(device, w, h, format);
+		if (!output->dumb[i])
+			goto err;
+
+		ret = drmPrimeHandleToFD(device->drm.fd, output->dumb[i]->handles[0], DRM_CLOEXEC,
+				       &output->dumb_dmafd[i]);
+		if(ret < 0)
+			goto err;
+
+		ret = b->g2d_renderer->create_g2d_image(g2dSurface, g2dFormat,
+						output->dumb[i]->map,
+						w, h,
+						output->dumb[i]->strides[0],
+						output->dumb[i]->size,
+						output->dumb_dmafd[i]);
+		if (ret < 0)
+			goto err;
+	}
+
+	if (b->g2d_renderer->drm_output_create(&output->base, &options) < 0)
+		goto err;
+
+	drm_output_init_cursor_egl(output, b);
+
+	return 0;
+
+err:
+	weston_log("drm_output_init_g2d failed.\n");
+	for (i = 0; i < ARRAY_LENGTH(output->dumb); i++) {
+		if (output->dumb[i])
+			drm_fb_unref(output->dumb[i]);
+
+		output->dumb[i] = NULL;
+	}
+
+	return -1;
+}
+
+void
+drm_output_fini_g2d(struct drm_output *output)
+{
+	unsigned int i;
+	struct drm_backend *b = to_drm_backend(output->base.compositor);
+
+	pixman_region32_fini(&output->previous_damage);
+
+	for (i = 0; i < ARRAY_LENGTH(output->dumb); i++) {
+		drm_fb_unref(output->dumb[i]);
+		output->dumb[i] = NULL;
+		close(output->dumb_dmafd[i]);
+	}
+	b->g2d_renderer->output_destroy(&output->base);
+}
+
+struct drm_fb *
+drm_output_render_g2d(struct drm_output_state *state, pixman_region32_t *damage)
+{
+	struct drm_output *output = state->output;
+	struct weston_compositor *ec = output->base.compositor;
+	struct drm_backend *b = to_drm_backend(output->base.compositor);
+	pixman_region32_t total_damage, previous_damage;
+
+	pixman_region32_init(&total_damage);
+	pixman_region32_init(&previous_damage);
+
+	pixman_region32_copy(&previous_damage, damage);
+
+	pixman_region32_union(&total_damage, damage, &output->previous_damage);
+	pixman_region32_copy(&output->previous_damage, &previous_damage);
+
+	output->current_image = (output->current_image + 1) % ARRAY_LENGTH(output->dumb);
+
+	b->g2d_renderer->output_set_buffer(&output->base,
+					  &output->g2d_image[output->current_image]);
+
+	ec->renderer->repaint_output(&output->base, &total_damage, NULL);
+
+	pixman_region32_fini(&total_damage);
+	pixman_region32_fini(&previous_damage);
+
+	return drm_fb_ref(output->dumb[output->current_image]);
+}
+
+#endif

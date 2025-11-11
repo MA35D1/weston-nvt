@@ -2889,6 +2889,7 @@ weston_buffer_from_resource(struct weston_compositor *ec,
 	struct linux_dmabuf_buffer *dmabuf;
 	struct wl_listener *listener;
 	struct weston_solid_buffer_values *solid;
+	bool need_buffer_init = true;
 
 	listener = wl_resource_get_destroy_listener(resource,
 						    weston_buffer_destroy_handler);
@@ -2937,6 +2938,17 @@ weston_buffer_from_resource(struct weston_compositor *ec,
 			buffer->buffer_origin = ORIGIN_BOTTOM_LEFT;
 		else
 			buffer->buffer_origin = ORIGIN_TOP_LEFT;
+
+		/* if backend can handle dmabuf directly, no need to use renderer to
+		 * initialize the buffer */
+		struct weston_backend *backend;
+		wl_list_for_each(backend, &ec->backend_list, link) {
+			if (!backend->import_dmabuf)
+				continue;
+
+			if (backend->import_dmabuf(ec, dmabuf))
+				need_buffer_init = false;
+		}
 	} else if ((solid = single_pixel_buffer_get(buffer->resource))) {
 		buffer->type = WESTON_BUFFER_SOLID;
 		buffer->solid = *solid;
@@ -2959,7 +2971,7 @@ weston_buffer_from_resource(struct weston_compositor *ec,
 		buffer->type = WESTON_BUFFER_RENDERER_OPAQUE;
 	}
 
-	if (ec->renderer->buffer_init)
+	if (ec->renderer->buffer_init && need_buffer_init)
 		ec->renderer->buffer_init(ec, buffer);
 
 	/* Don't accept any formats we can't reason about: the importer should
@@ -3266,6 +3278,7 @@ weston_surface_attach(struct weston_surface *surface,
 {
 	struct weston_buffer *buffer = state->buffer;
 	struct weston_buffer *old_buffer = surface->buffer_ref.buffer;
+	struct weston_paint_node *pnode;
 
 	if (!buffer) {
 		if (weston_surface_is_mapped(surface)) {
@@ -3323,6 +3336,12 @@ weston_surface_attach(struct weston_surface *surface,
 	old_buffer = NULL;
 	weston_buffer_reference(&surface->buffer_ref, buffer,
 				BUFFER_MAY_BE_ACCESSED);
+
+	wl_list_for_each(pnode, &surface->paint_node_list, surface_link) {
+		assert(pnode->surface == surface);
+		surface->compositor->renderer->attach(pnode);
+		break;
+	}
 
 	return status;
 }
@@ -3815,14 +3834,6 @@ weston_output_repaint(struct weston_output *output, struct timespec *now)
 		 * same surface.
 		 */
 		if (pnode->surface->output != output)
-			continue;
-
-		/*
-		 * avoid adding pnode's frame callbacks/presented
-		 * feedback to the respective lists if pnode/surface is
-		 * occluded
-		 */
-		if (!pixman_region32_not_empty(&pnode->visible))
 			continue;
 
 		wl_list_insert_list(&frame_callback_list,
@@ -9895,8 +9906,18 @@ weston_compositor_import_dmabuf(struct weston_compositor *compositor,
 				struct linux_dmabuf_buffer *buffer)
 {
 	struct weston_renderer *renderer;
+	struct weston_backend *backend;
 
 	renderer = compositor->renderer;
+
+	/* first try backend import, if fail, fallback to render import */
+	wl_list_for_each(backend, &compositor->backend_list, link) {
+		if (!backend->import_dmabuf)
+			continue;
+
+		if(backend->import_dmabuf(compositor, buffer))
+			return true;
+	}
 
 	if (renderer->import_dmabuf == NULL)
 		return false;

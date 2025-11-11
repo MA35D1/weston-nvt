@@ -121,6 +121,7 @@ config_h.set_quoted('PACKAGE_BUGREPORT', 'https://gitlab.freedesktop.org/wayland
 
 config_h.set_quoted('BINDIR', dir_bin)
 config_h.set_quoted('DATADIR', dir_data)
+config_h.set_quoted('LIBDIR', dir_lib)
 config_h.set_quoted('LIBEXECDIR', dir_libexec)
 config_h.set_quoted('MODULEDIR', dir_module_weston)
 config_h.set_quoted('LIBWESTON_MODULEDIR', dir_module_libweston)
@@ -158,6 +159,11 @@ dep_threads = dependency('threads')
 dep_lcms2 = dependency('lcms2', version: '>= 2.9', required: false)
 if dep_lcms2.found()
 	config_h.set('HAVE_LCMS', '1')
+endif
+
+dep_libdrm_version = dep_libdrm.version()
+if dep_libdrm_version.version_compare('>=2.4.107')
+  config_h.set('USE_DRM_FORMAT_NV15', '1')
 endif
 
 prog_python = import('python').find_installation('python3')

@@ -827,6 +827,8 @@ shared_output_repainted(struct wl_listener *listener, void *data)
 	pixman_region32_t sb_damage;
 	pixman_region32_t output_damage;
 	pixman_region32_t *global_output_damage;
+	struct weston_config *config;
+	struct weston_config_section *section;
 	struct ss_shm_buffer *sb;
 	int32_t x, y, width, height, stride;
 	int i, nrects, do_yflip, y_orig;
@@ -836,6 +838,13 @@ shared_output_repainted(struct wl_listener *listener, void *data)
 	const struct pixel_format_info *read_format =
 		so->output->compositor->read_format;
 	const pixman_format_code_t pixman_format = read_format->pixman_format;
+
+	bool use_g2d;
+
+	config = wet_get_config(so->output->compositor);
+	section = weston_config_get_section(config, "core", NULL, NULL);
+
+	weston_config_section_get_bool(section, "use-g2d", &use_g2d, false);
 
 	width = so->output->current_mode->width;
 	height = so->output->current_mode->height;
@@ -882,8 +891,12 @@ shared_output_repainted(struct wl_listener *listener, void *data)
 
 	/* Get damage in output coordinates */
 	pixman_region32_init(&output_damage);
-	weston_region_global_to_output(&output_damage, so->output,
-				       global_output_damage);
+	if (use_g2d)
+		/* 2D no need global to output coordinate transform */
+		pixman_region32_copy(&output_damage, global_output_damage);
+	else
+		weston_region_global_to_output(&output_damage, so->output,
+					       global_output_damage);
 
 	if (shared_output_ensure_tmp_data(so, &output_damage) < 0)
 		goto err_pixman_init;
@@ -900,7 +913,7 @@ shared_output_repainted(struct wl_listener *listener, void *data)
 		width = r[i].x2 - r[i].x1;
 		height = r[i].y2 - r[i].y1;
 
-		if (do_yflip)
+		if (do_yflip && !use_g2d)
 			y_orig = so->output->current_mode->height - r[i].y2;
 		else
 			y_orig = y;

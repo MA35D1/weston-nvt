@@ -563,7 +563,7 @@ struct weston_output {
 
 	struct wl_list animation_list;
 	struct weston_coord_global pos;
-	int32_t width, height;
+	int32_t x, y, width, height;
 
 	/** List of paint nodes in z-order, from top to bottom, maybe pruned
 	 *
@@ -1701,6 +1701,8 @@ struct weston_buffer_viewport {
 		 */
 		int32_t width, height;
 	} surface;
+
+	int changed;
 };
 
 struct weston_buffer_release {
@@ -1870,6 +1872,7 @@ struct weston_surface_state {
 	enum weston_surface_status status;
 
 	/* wl_surface.attach */
+	int newly_attached;
 	struct weston_buffer *buffer;
 	struct wl_listener buffer_destroy_listener;
 
@@ -2467,6 +2470,9 @@ enum weston_renderer_type {
 	WESTON_RENDERER_NOOP = 1,
 	WESTON_RENDERER_PIXMAN = 2,
 	WESTON_RENDERER_GL = 3,
+#if defined(ENABLE_IMXG2D)
+	WESTON_RENDERER_G2D = 4,
+#endif
 };
 
 struct weston_backend *

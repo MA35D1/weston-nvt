@@ -211,6 +211,7 @@ drm_fb_addfb(struct drm_device *device, struct drm_fb *fb)
 {
 	int ret = -EINVAL;
 	uint64_t mods[4] = { };
+	int width, height;
 	size_t i;
 
 	ret = drm_fb_maybe_import(device, fb);
@@ -224,7 +225,17 @@ drm_fb_addfb(struct drm_device *device, struct drm_fb *fb)
 		 * for all planes. */
 		for (i = 0; i < ARRAY_LENGTH(mods) && fb->handles[i]; i++)
 			mods[i] = fb->modifier;
-		ret = drmModeAddFB2WithModifiers(fb->fd, fb->width, fb->height,
+		if (fb->modifier == DRM_FORMAT_MOD_AMPHION_TILED) {
+			width = ALIGNTO (fb->width, 8);
+			height = ALIGNTO (fb->height, 256);
+		}else if(fb->modifier ==DRM_FORMAT_MOD_VIVANTE_SUPER_TILED){
+			width = ALIGNTO (fb->width, 64);
+			height = ALIGNTO (fb->height, 64);
+		} else {
+			width = fb->width;
+			height = fb->height;
+		}
+		ret = drmModeAddFB2WithModifiers(fb->fd, width, height,
 						 fb->format->format,
 						 fb->handles, fb->strides,
 						 fb->offsets, mods, &fb->fb_id,
@@ -371,6 +382,40 @@ drm_fb_destroy_dmabuf(struct drm_fb *fb)
 	drm_fb_destroy(fb);
 }
 
+int
+drm_fb_get_gbm_alignment(struct drm_fb *fb)
+{
+	int gbm_aligned = 64;
+
+	if (fb){
+		switch(fb->modifier) {
+			case DRM_FORMAT_MOD_VIVANTE_SUPER_TILED_FC:
+			case DRM_FORMAT_MOD_VIVANTE_SUPER_TILED:
+				gbm_aligned = 64;
+			break;
+			default:
+				gbm_aligned = 1;
+			break;
+		}
+	}
+	return gbm_aligned;
+}
+
+static void
+drm_close_gem_handle(struct linux_dmabuf_buffer *dmabuf)
+{
+	struct drm_backend *b = to_drm_backend(dmabuf->compositor);
+	int i;
+
+	if (dmabuf->gem_handles[0] != 0) {
+		for (i = 0; i < dmabuf->attributes.n_planes; i++) {
+			struct drm_gem_close arg = { dmabuf->gem_handles[i], };
+			drmIoctl (b->drm->drm.fd, DRM_IOCTL_GEM_CLOSE, &arg);
+			dmabuf->gem_handles[i] = 0;
+		}
+	}
+}
+
 static struct drm_fb *
 drm_fb_get_from_dmabuf(struct linux_dmabuf_buffer *dmabuf,
 		       struct drm_device *device, bool is_opaque,
@@ -379,6 +424,7 @@ drm_fb_get_from_dmabuf(struct linux_dmabuf_buffer *dmabuf,
 	struct drm_backend *backend = device->backend;
 	struct drm_fb *fb;
 	int i;
+	uint32_t gem_handle[MAX_DMABUF_PLANES] = {0};
 	struct gbm_import_fd_modifier_data import_mod = {
 		.width = dmabuf->attributes.width,
 		.height = dmabuf->attributes.height,
@@ -420,23 +466,10 @@ drm_fb_get_from_dmabuf(struct linux_dmabuf_buffer *dmabuf,
 	fb->refcnt = 1;
 	fb->type = BUFFER_DMABUF;
 	fb->backend = device->backend;
-
-	ARRAY_COPY(import_mod.fds, dmabuf->attributes.fd);
-	ARRAY_COPY(import_mod.strides, dmabuf->attributes.stride);
-	ARRAY_COPY(import_mod.offsets, dmabuf->attributes.offset);
-
-	fb->bo = gbm_bo_import(backend->gbm, GBM_BO_IMPORT_FD_MODIFIER,
-			       &import_mod, GBM_BO_USE_SCANOUT);
-	if (!fb->bo) {
-		if (try_view_on_plane_failure_reasons)
-			*try_view_on_plane_failure_reasons |=
-				FAILURE_REASONS_GBM_BO_IMPORT_FAILED;
-		goto err_free;
-	}
-
 	fb->width = dmabuf->attributes.width;
 	fb->height = dmabuf->attributes.height;
 	fb->modifier = dmabuf->attributes.modifier;
+	fb->dtrc_meta = dmabuf->attributes.dtrc_meta;
 	fb->size = 0;
 	fb->fd = device->drm.fd;
 
@@ -462,6 +495,35 @@ drm_fb_get_from_dmabuf(struct linux_dmabuf_buffer *dmabuf,
 	}
 
 	fb->num_planes = dmabuf->attributes.n_planes;
+	if (dmabuf->gem_handles[0] == 0) {
+		for (i = 0; i < dmabuf->attributes.n_planes; i++) {
+			int ret;
+			ret = drmPrimeFDToHandle (fb->fd, dmabuf->attributes.fd[i], &gem_handle[i]);
+			if (ret) {
+				weston_log ("got gem_handle %x\n", gem_handle[i]);
+				goto err_free;
+			}
+			fb->handles[i] = dmabuf->gem_handles[i] = gem_handle[i];
+		}
+		linux_dmabuf_buffer_gem_handle_close_cb (dmabuf, drm_close_gem_handle);
+	} else {
+		for (i = 0; i < dmabuf->attributes.n_planes; i++)
+			fb->handles[i] = dmabuf->gem_handles[i];
+	}
+
+	if (fb->handles[0] != 0)
+		goto add_fb;
+
+	ARRAY_COPY(import_mod.fds, dmabuf->attributes.fd);
+	ARRAY_COPY(import_mod.strides, dmabuf->attributes.stride);
+	ARRAY_COPY(import_mod.offsets, dmabuf->attributes.offset);
+
+	fb->bo = gbm_bo_import(backend->gbm, GBM_BO_IMPORT_FD_MODIFIER,
+			       &import_mod, GBM_BO_USE_SCANOUT);
+	if (!fb->bo)
+		goto err_free;
+
+	fb->num_planes = dmabuf->attributes.n_planes;
 	for (i = 0; i < dmabuf->attributes.n_planes; i++) {
 		union gbm_bo_handle handle;
 
@@ -474,6 +536,7 @@ drm_fb_get_from_dmabuf(struct linux_dmabuf_buffer *dmabuf,
 		fb->handles[i] = handle.u32;
 	}
 
+add_fb:
 	if (drm_fb_addfb(device, fb) != 0) {
 		if (try_view_on_plane_failure_reasons)
 			*try_view_on_plane_failure_reasons |=
@@ -497,7 +560,17 @@ drm_fb_get_from_bo(struct gbm_bo *bo, struct drm_device *device,
 
 	if (fb) {
 		assert(fb->type == type);
-		return drm_fb_ref(fb);
+
+		bool is_fb_opaque = (!fb->format->opaque_substitute);
+
+		/* If fb->format doesn't meet the opaque requirement and there is
+		 * no reference being taken for this fb, we will convert the fb
+		 * format to a suitable format. */
+		if ((is_opaque != is_fb_opaque) && (fb->refcnt == 0) &&
+		    (fb->fb_id != 0))
+			drm_fb_destroy(fb);
+		else
+			return drm_fb_ref(fb);
 	}
 
 	fb = zalloc(sizeof *fb);
@@ -732,10 +805,13 @@ drm_fb_get_from_paint_node(struct drm_output_state *state,
 		if (!fb)
 			goto unsuitable;
 	} else if (buffer->type == WESTON_BUFFER_RENDERER_OPAQUE) {
-		struct gbm_bo *bo;
+		struct gbm_bo *bo = NULL;
 
-		bo = gbm_bo_import(b->gbm, GBM_BO_IMPORT_WL_BUFFER,
-				   buffer->resource, GBM_BO_USE_SCANOUT);
+		if(b->enable_overlay_view)
+		{
+			bo = gbm_bo_import(b->gbm, GBM_BO_IMPORT_WL_BUFFER,
+					   buffer->resource, GBM_BO_USE_SCANOUT);
+		}
 		if (!bo)
 			goto unsuitable;
 

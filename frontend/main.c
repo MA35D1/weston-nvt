@@ -740,6 +740,9 @@ usage(int error_code)
 		"  --drm-device=CARD\tThe DRM device to use for rendering and output, e.g. \"card0\".\n"
 		"  --additional-devices=CARD\tSecondary DRM devices to use for output only, e.g. \"card1,card2\".\n"
 		"  --use-pixman\t\tUse the pixman (CPU) renderer (deprecated alias for --renderer=pixman)\n"
+#if defined(ENABLE_IMXG2D)
+		"  --use-g2d\t\tUse the G2D renderer (default: GL rendering)\n"
+#endif
 		"  --current-mode\tPrefer current KMS mode over EDID preferred mode\n"
 		"  --continue-without-input\tAllow the compositor to start without input devices\n\n");
 #endif
@@ -935,29 +938,24 @@ handle_primary_client_destroyed(struct wl_listener *listener, void *data)
 static int
 weston_create_listening_socket(struct wl_display *display, const char *socket_name)
 {
-	char name_candidate[32];
-
 	if (socket_name) {
 		if (wl_display_add_socket(display, socket_name)) {
 			weston_log("fatal: failed to add socket: %s\n",
 				   strerror(errno));
 			return -1;
 		}
-
-		setenv("WAYLAND_DISPLAY", socket_name, 1);
-		return 0;
 	} else {
-		for (int i = 1; i <= 32; i++) {
-			sprintf(name_candidate, "wayland-%d", i);
-			if (wl_display_add_socket(display, name_candidate) >= 0) {
-				setenv("WAYLAND_DISPLAY", name_candidate, 1);
-				return 0;
-			}
+		socket_name = wl_display_add_socket_auto(display);
+		if (!socket_name) {
+			weston_log("fatal: failed to add socket: %s\n",
+				   strerror(errno));
+			return -1;
 		}
-		weston_log("fatal: failed to add socket: %s\n",
-			   strerror(errno));
-		return -1;
 	}
+
+	setenv("WAYLAND_DISPLAY", socket_name, 1);
+
+	return 0;
 }
 
 WL_EXPORT int
@@ -1817,7 +1815,7 @@ wet_config_head_has_mirror_of_entry(struct wet_compositor *wet, char *head_name)
 static void
 parse_simple_mode(struct weston_output *output,
 		  struct weston_config_section *section, int *width,
-		  int *height, struct wet_output_config *defaults,
+		  int *height, int *framerate, struct wet_output_config *defaults,
 		  struct wet_output_config *parsed_options)
 {
 	*width = defaults->width;
@@ -1827,11 +1825,12 @@ parse_simple_mode(struct weston_output *output,
 		char *mode;
 
 		weston_config_section_get_string(section, "mode", &mode, NULL);
-		if (!mode || sscanf(mode, "%dx%d", width, height) != 2) {
+		if (!mode || sscanf(mode, "%dx%d@%d", width, height, framerate) < 2) {
 			weston_log("Invalid mode for output %s. Using defaults.\n",
 				   output->name);
 			*width = defaults->width;
 			*height = defaults->height;
+			*framerate = -1;
 		}
 		free(mode);
 	}
@@ -1857,6 +1856,7 @@ wet_configure_windowed_output_from_config(struct weston_output *output,
 	struct wet_output_config *parsed_options = compositor->parsed_options;
 	int width;
 	int height;
+	int framerate = -1;
 
 	assert(parsed_options);
 
@@ -1867,7 +1867,7 @@ wet_configure_windowed_output_from_config(struct weston_output *output,
 
 	section = weston_config_get_section(wc, "output", "name", output->name);
 
-	parse_simple_mode(output, section, &width, &height, defaults,
+	parse_simple_mode(output, section, &width, &height, &framerate, defaults,
 			  parsed_options);
 
 	allow_content_protection(output, section);
@@ -3371,6 +3371,33 @@ wet_compositor_load_backend(struct weston_compositor *compositor,
 	return wb;
 }
 
+static void
+drm_backend_shell_configure(struct weston_compositor *c,
+		struct weston_drm_backend_config *config)
+{
+	struct weston_config_section *section;
+	section = weston_config_get_section(wet_get_config(c),
+					    "shell", NULL, NULL);
+
+	if (section) {
+		char *size;
+		int n;
+		uint32_t width = 0;
+		uint32_t height = 0;
+
+		weston_config_section_get_string(section, "size", &size, NULL);
+
+		if(size){
+			n = sscanf(size, "%dx%d", &width, &height);
+			if (n == 2 && width > 0 && height > 0) {
+				config->shell_width  = width;
+				config->shell_height = height;
+			}
+			free(size);
+		}
+	}
+}
+
 static int
 load_drm_backend(struct weston_compositor *c, int *argc, char **argv,
 		 struct weston_config *wc, enum weston_renderer_type renderer)
@@ -3382,6 +3409,11 @@ load_drm_backend(struct weston_compositor *c, int *argc, char **argv,
 	bool without_input = false;
 	bool force_pixman = false;
 
+#if defined(ENABLE_IMXG2D)
+	bool use_g2d = false;
+#endif
+	uint32_t enable_overlay_view;
+
 	wet->drm_use_current_mode = false;
 
 	section = weston_config_get_section(wc, "core", NULL, NULL);
@@ -3389,12 +3421,20 @@ load_drm_backend(struct weston_compositor *c, int *argc, char **argv,
 	weston_config_section_get_bool(section, "use-pixman", &force_pixman,
 				       false);
 
+#if defined(ENABLE_IMXG2D)
+	weston_config_section_get_bool(section, "use-g2d", &config.use_g2d,
+				       use_g2d);
+#endif
+
 	const struct weston_option options[] = {
 		{ WESTON_OPTION_STRING, "seat", 0, &config.seat_id },
 		{ WESTON_OPTION_STRING, "drm-device", 0, &config.specific_device },
 		{ WESTON_OPTION_STRING, "additional-devices", 0, &config.additional_devices},
 		{ WESTON_OPTION_BOOLEAN, "current-mode", 0, &wet->drm_use_current_mode },
 		{ WESTON_OPTION_BOOLEAN, "use-pixman", 0, &force_pixman },
+#if defined(ENABLE_IMXG2D)
+		{ WESTON_OPTION_BOOLEAN, "use-g2d", 0, &config.use_g2d },
+#endif
 		{ WESTON_OPTION_BOOLEAN, "continue-without-input", false, &without_input }
 	};
 
@@ -3405,6 +3445,10 @@ load_drm_backend(struct weston_compositor *c, int *argc, char **argv,
 		return -1;
 	} else if (force_pixman) {
 		config.renderer = WESTON_RENDERER_PIXMAN;
+#if defined(ENABLE_IMXG2D)
+	}else if (config.use_g2d) {
+		config.renderer = WESTON_RENDERER_G2D;
+#endif
 	} else {
 		config.renderer = renderer;
 	}
@@ -3420,11 +3464,16 @@ load_drm_backend(struct weston_compositor *c, int *argc, char **argv,
 	if (without_input)
 		c->require_input = !without_input;
 
+	weston_config_section_get_uint(section, "enable-overlay-view", &enable_overlay_view, 0);
+	config.enable_overlay_view = enable_overlay_view;
+
 	config.base.struct_version = WESTON_DRM_BACKEND_CONFIG_VERSION;
 	config.base.struct_size = sizeof(struct weston_drm_backend_config);
 	config.configure_device = configure_input_device;
 
 	warn_possible_tty();
+
+	drm_backend_shell_configure(c, &config);
 
 	wb = wet_compositor_load_backend(c, WESTON_BACKEND_DRM, &config.base,
 					 drm_heads_changed, NULL);
@@ -3569,6 +3618,7 @@ pipewire_backend_output_configure(struct weston_output *output)
 	char *gbm_format = NULL;
 	int width;
 	int height;
+	int framerate = -1;
 
 	assert(parsed_options);
 
@@ -3579,7 +3629,7 @@ pipewire_backend_output_configure(struct weston_output *output)
 
 	section = weston_config_get_section(wc, "output", "name", output->name);
 
-	parse_simple_mode(output, section, &width, &height, &defaults,
+	parse_simple_mode(output, section, &width, &height, &framerate, &defaults,
 			  parsed_options);
 
 	weston_config_section_get_string(section, "gbm-format", &gbm_format, NULL);
@@ -3590,7 +3640,7 @@ pipewire_backend_output_configure(struct weston_output *output)
 	api->set_gbm_format(output, gbm_format);
 	free(gbm_format);
 
-	if (api->output_set_size(output, width, height) < 0) {
+	if (api->output_set_size(output, width, height, framerate) < 0) {
 		weston_log("Cannot configure output \"%s\" using weston_pipewire_output_api.\n",
 			   output->name);
 		return -1;
@@ -3805,6 +3855,7 @@ vnc_backend_output_configure(struct weston_output *output)
 	struct weston_config_section *section;
 	int width;
 	int height;
+	int framerate = -1;
 	bool resizeable;
 
 	assert(parsed_options);
@@ -3816,7 +3867,7 @@ vnc_backend_output_configure(struct weston_output *output)
 
 	section = weston_config_get_section(wc, "output", "name", output->name);
 
-	parse_simple_mode(output, section, &width, &height, &defaults,
+	parse_simple_mode(output, section, &width, &height, &framerate, &defaults,
 			  compositor->parsed_options);
 
 	weston_config_section_get_bool(section, "resizeable", &resizeable, true);
@@ -4409,6 +4460,18 @@ sigint_helper(int sig)
 	raise(SIGUSR2);
 }
 
+static void
+wet_set_environment_variables(struct weston_compositor *c)
+{
+	struct weston_config_section *section;
+
+	section = weston_config_get_section(wet_get_config(c),
+					    "environment-variables", NULL, NULL);
+	if (section) {
+		weston_config_set_env(section);
+	}
+}
+
 WL_EXPORT int
 wet_main(int argc, char *argv[], const struct weston_testsuite_data *test_data)
 {
@@ -4651,6 +4714,9 @@ wet_main(int argc, char *argv[], const struct weston_testsuite_data *test_data)
 	}
 
 	wet.compositor->multi_backend = backends && strchr(backends, ',');
+
+	wet_set_environment_variables(wet.compositor);
+
 	if (load_backends(wet.compositor, backends, &argc, argv, config,
 			  renderer) < 0) {
 		weston_log("fatal: failed to create compositor backend\n");

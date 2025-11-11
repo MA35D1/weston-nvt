@@ -51,6 +51,8 @@
 #include <libweston/libweston.h>
 #include <libweston/backend-drm.h>
 #include <libweston/weston-log.h>
+#include <libweston/config-parser.h>
+#include "frontend/weston.h"
 #include "drm-internal.h"
 #include "shared/hash.h"
 #include "shared/helpers.h"
@@ -68,8 +70,10 @@
 #include "linux-dmabuf.h"
 #include "linux-dmabuf-unstable-v1-server-protocol.h"
 #include "linux-explicit-synchronization.h"
+#include "hdr10-metadata-unstable-v1-server-protocol.h"
 
 static const char default_seat[] = "seat0";
+#define MAX_OVERLAY_NUM 2
 
 static void
 drm_backend_create_faked_zpos(struct drm_device *device)
@@ -392,7 +396,10 @@ drm_output_render(struct drm_output_state *state)
 	struct drm_plane *scanout_plane = output->scanout_plane;
 	struct drm_property_info *damage_info =
 		&scanout_plane->props[WDRM_PLANE_FB_DAMAGE_CLIPS];
+	struct drm_backend *b = device->backend;
 	struct drm_fb *fb;
+	uint32_t width;
+	uint32_t height;
 	pixman_region32_t damage, scanout_damage;
 	pixman_box32_t *rects;
 	int n_rects;
@@ -414,16 +421,38 @@ drm_output_render(struct drm_output_state *state)
 	 * area. But, we still have to call the renderer anyway if any screen
 	 * capture is pending, otherwise the capture will not complete.
 	 */
+
+#ifdef BUILD_DRM_GBM
+       int gbm_aligned = drm_fb_get_gbm_alignment (scanout_plane->state_cur->fb);
+#endif
+
 	if (!pixman_region32_not_empty(&damage) &&
 	    wl_list_empty(&output->base.frame_signal.listener_list) &&
 	    !weston_output_has_renderer_capture_tasks(&output->base) &&
 	    scanout_plane->state_cur->fb &&
 	    (scanout_plane->state_cur->fb->type == BUFFER_GBM_SURFACE ||
-	     scanout_plane->state_cur->fb->type == BUFFER_PIXMAN_DUMB)) {
+	     scanout_plane->state_cur->fb->type == BUFFER_PIXMAN_DUMB) &&
+#ifdef BUILD_DRM_GBM
+	    scanout_plane->state_cur->fb->width ==
+		ALIGNTO(output->base.current_mode->width, gbm_aligned) &&
+	    scanout_plane->state_cur->fb->height ==
+		ALIGNTO(output->base.current_mode->height, gbm_aligned)) {
+#else
+	    scanout_plane->state_cur->fb->width ==
+		output->base.current_mode->width &&
+	    scanout_plane->state_cur->fb->height ==
+		output->base.current_mode->height) {
+#endif
 		fb = drm_fb_ref(scanout_plane->state_cur->fb);
 	} else if (c->renderer->type == WESTON_RENDERER_PIXMAN) {
 		fb = drm_output_render_pixman(state, &damage);
-	} else {
+	}
+#if defined(ENABLE_IMXG2D)
+	else if (b->use_g2d) {
+		fb = drm_output_render_g2d(state, &damage);
+	}
+#endif
+	else {
 		fb = drm_output_render_gl(state, &damage);
 	}
 
@@ -437,13 +466,23 @@ drm_output_render(struct drm_output_state *state)
 
 	scanout_state->src_x = 0;
 	scanout_state->src_y = 0;
-	scanout_state->src_w = fb->width << 16;
-	scanout_state->src_h = fb->height << 16;
+	scanout_state->src_w = output->base.current_mode->width << 16;
+	scanout_state->src_h = output->base.current_mode->height << 16;
 
 	scanout_state->dest_x = 0;
 	scanout_state->dest_y = 0;
-	scanout_state->dest_w = output->base.current_mode->width;
-	scanout_state->dest_h = output->base.current_mode->height;
+	scanout_state->dest_w = scanout_state->src_w >> 16;
+	scanout_state->dest_h = scanout_state->src_h >> 16;
+	if ( output->base.transform == WL_OUTPUT_TRANSFORM_NORMAL &&
+		b->shell_width > 0 &&
+		b->shell_height > 0) {
+		width = b->shell_width << 16;
+		height = b->shell_height << 16;
+		if (scanout_state->src_w > width && scanout_state->src_h > width){
+			scanout_state->src_w = width;
+			scanout_state->src_h = height;
+		}
+	}
 
 	scanout_state->zpos = scanout_plane->zpos_min;
 
@@ -1092,6 +1131,15 @@ drm_output_apply_mode(struct drm_output *output)
 				   "new mode\n");
 			return -1;
 		}
+#if defined(ENABLE_IMXG2D)
+	} else if (b->use_g2d) {
+		drm_output_fini_g2d(output);
+		if (drm_output_init_g2d(output, b) < 0) {
+			weston_log("failed to init output g2d state with "
+				   "new mode\n");
+			return -1;
+		}
+#endif
 	} else {
 		drm_output_fini_egl(output);
 		if (drm_output_init_egl(output, b) < 0) {
@@ -1134,7 +1182,7 @@ init_pixman(struct drm_backend *b)
  * @param kplane DRM plane to create
  */
 static struct drm_plane *
-drm_plane_create(struct drm_device *device, const drmModePlane *kplane)
+drm_plane_create(struct drm_device *device, const drmModePlane *kplane, int *count_overlay)
 {
 	struct drm_backend *b = device->backend;
 	struct weston_compositor *compositor = b->compositor;
@@ -1172,6 +1220,11 @@ drm_plane_create(struct drm_device *device, const drmModePlane *kplane)
 		drm_property_get_value(&plane->props[WDRM_PLANE_TYPE],
 				       props,
 				       WDRM_PLANE_TYPE__COUNT);
+
+	if (plane->type == WDRM_PLANE_TYPE_OVERLAY && ++(*count_overlay) > MAX_OVERLAY_NUM) {
+		drmModeFreeObjectProperties(props);
+		goto err;
+	}
 
 	zpos_range_values =
 		drm_property_get_range_values(&plane->props[WDRM_PLANE_ZPOS],
@@ -1328,6 +1381,7 @@ create_sprites(struct drm_device *device)
 	drmModePlane *kplane;
 	struct drm_plane *drm_plane;
 	uint32_t i;
+	int count_overlay = 0;
 	uint32_t next_plane_idx = 0;
 	uint64_t primary_plane_zpos_min = DRM_PLANE_ZPOS_INVALID_PLANE;
 	kplane_res = drmModeGetPlaneResources(device->drm.fd);
@@ -1343,7 +1397,7 @@ create_sprites(struct drm_device *device)
 		if (!kplane)
 			continue;
 
-		drm_plane = drm_plane_create(device, kplane);
+		drm_plane = drm_plane_create(device, kplane, &count_overlay);
 		drmModeFreePlane(kplane);
 		if (!drm_plane)
 			continue;
@@ -1750,6 +1804,10 @@ parse_gbm_format(const char *s, const struct pixel_format_info *default_format,
 {
 	if (s == NULL) {
 		*format = default_format;
+
+		return 0;
+	}else if (strcmp(s, "argb8888") == 0) {
+		*format = pixel_format_get_info(DRM_FORMAT_ARGB8888);
 
 		return 0;
 	}
@@ -2336,6 +2394,13 @@ drm_output_enable(struct weston_output *base)
 			weston_log("Failed to init output pixman state\n");
 			goto err_planes;
 		}
+#if defined(ENABLE_IMXG2D)
+	} else if (b->use_g2d) {
+		if (drm_output_init_g2d(output, b) < 0) {
+			weston_log("Failed to init output g2d state\n");
+			goto err_planes;
+		}
+#endif
 	} else if (drm_output_init_egl(output, b) < 0) {
 		weston_log("Failed to init output gl state\n");
 		goto err_planes;
@@ -2386,6 +2451,10 @@ drm_output_deinit(struct weston_output *base)
 
 	if (b->compositor->renderer->type == WESTON_RENDERER_PIXMAN)
 		drm_output_fini_pixman(output);
+#if defined(ENABLE_IMXG2D)
+	else if (b->use_g2d)
+		drm_output_fini_g2d(output);
+#endif
 	else
 		drm_output_fini_egl(output);
 
@@ -2844,6 +2913,7 @@ drm_output_create(struct weston_backend *backend, const char *name)
 	output->max_bpc = 16;
 #ifdef BUILD_DRM_GBM
 	output->gbm_bo_flags = GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING;
+	output->surface_get_in_fence_fd = weston_load_module("libgbm.so", "gbm_surface_get_in_fence_fd", LIBDIR);
 #endif
 
 	weston_output_init(&output->base, b->compositor, name);
@@ -3465,6 +3535,8 @@ drm_destroy(struct weston_backend *backend)
 			drm_head_destroy(base);
 	}
 
+	weston_drm_format_array_fini(&b->supported_formats);
+
 	wl_list_for_each_safe(writeback, writeback_tmp,
 			      &b->drm->writeback_connector_list, link)
 		drm_writeback_destroy(writeback);
@@ -3482,6 +3554,16 @@ drm_destroy(struct weston_backend *backend)
 
 	hash_table_destroy(device->gem_handle_refcnt);
 
+	if(b->enable_overlay_view){
+		/* remove enable-overlay-view */
+		char *dir, *path;
+		dir = getenv("XDG_RUNTIME_DIR");
+		path = malloc(strlen(dir) + 40);
+		strcpy(path, dir);
+		strcat(path, "/enable-overlay-view");
+		remove(path);
+		free(path);
+	}
 	free(device->drm.filename);
 	free(device);
 	free(b);
@@ -3547,6 +3629,35 @@ drm_device_changed(struct weston_backend *backend,
 
 	compositor->session_active = added;
 	wl_signal_emit(&compositor->session_signal, compositor);
+}
+
+static const struct weston_drm_format_array *
+drm_get_supported_formats(struct weston_compositor *ec)
+{
+	struct drm_backend *b = to_drm_backend(ec);
+
+	return &b->supported_formats;
+}
+
+/* for drm backend, currently we only need expose overlay plane formats,
+ * because primary will been used by renderer */
+static int
+populate_supported_formats(struct drm_backend *b)
+{
+	int ret = 0;
+	struct drm_plane *plane;
+
+	wl_list_for_each(plane, &b->drm->plane_list, link) {
+		if (plane->type != WDRM_PLANE_TYPE_OVERLAY)
+			continue;
+
+		ret = weston_drm_format_array_join(&b->supported_formats,
+						   &plane->formats);
+		if (ret < 0)
+			break;
+	}
+
+	return ret;
 }
 
 /**
@@ -3953,6 +4064,147 @@ static const struct weston_drm_output_api api = {
 	drm_output_set_content_type,
 };
 
+/**
+ * Test if drm driver can import dmabuf
+ *
+ * called by compositor when a dmabuf comes to test if this buffer
+ * can used by drm driver directly
+ */
+static bool
+drm_import_dmabuf(struct weston_compositor *compositor,
+	struct linux_dmabuf_buffer *dmabuf)
+{
+	struct drm_backend *b = to_drm_backend(compositor);
+	struct drm_plane *p;
+	uint64_t has_prime;
+	int ret;
+
+	if (!dmabuf)
+		return false;
+
+	ret = drmGetCap (b->drm->drm.fd, DRM_CAP_PRIME, &has_prime);
+	if (ret || !(bool) (has_prime & DRM_PRIME_CAP_IMPORT)) {
+	        weston_log("drm backend not support import DMABUF\n");
+	        return false;
+	}
+
+	wl_list_for_each(p, &b->drm->plane_list, link) {
+		if (p->type != WDRM_PLANE_TYPE_OVERLAY)
+			continue;
+		struct weston_drm_format * format =
+#if USE_DRM_FORMAT_NV15
+			weston_drm_format_array_find_format (&p->formats, DRM_FORMAT_NV15);
+#else
+			weston_drm_format_array_find_format (&p->formats, DRM_FORMAT_NV12_10LE40);
+#endif
+
+#if USE_DRM_FORMAT_NV15
+		if (format && dmabuf->attributes.format == DRM_FORMAT_NV15)
+#else
+		if (format && dmabuf->attributes.format == DRM_FORMAT_NV12_10LE40)
+#endif
+			return true;
+	}
+
+	return false;
+}
+
+static void
+hdr10_metadata_destroy(struct wl_client *client,
+			  struct wl_resource *resource)
+{
+	wl_resource_destroy(resource);
+}
+
+static void
+hdr10_metadata_set_metadata(struct wl_client *client,
+			     struct wl_resource *resource,
+			     uint32_t eotf,
+				 uint32_t type,
+			     uint32_t display_primaries_red,
+			     uint32_t display_primaries_green,
+			     uint32_t display_primaries_blue,
+			     uint32_t white_point,
+			     uint32_t mastering_display_luminance,
+			     uint32_t max_cll,
+				 uint32_t max_fall)
+{
+	struct weston_compositor *compositor = wl_resource_get_user_data(resource);
+	struct drm_backend *b = to_drm_backend(compositor);
+	struct hdr_output_metadata hdr_metadata;
+
+	if (eotf == 0) {
+		b->drm->clean_hdr_blob = true;
+		return;
+	}
+
+	hdr_metadata.metadata_type = 0;
+	hdr_metadata.hdmi_metadata_type1.eotf = eotf & 0xff;
+	hdr_metadata.hdmi_metadata_type1.metadata_type = type & 0xff;
+	hdr_metadata.hdmi_metadata_type1.display_primaries[0].x = (display_primaries_red >> 16) & 0xffff;
+	hdr_metadata.hdmi_metadata_type1.display_primaries[0].y = display_primaries_red & 0xffff;
+	hdr_metadata.hdmi_metadata_type1.display_primaries[1].x = (display_primaries_green >> 16) & 0xffff;
+	hdr_metadata.hdmi_metadata_type1.display_primaries[1].y = display_primaries_green & 0xffff;
+	hdr_metadata.hdmi_metadata_type1.display_primaries[2].x = (display_primaries_blue >> 16) & 0xffff;
+	hdr_metadata.hdmi_metadata_type1.display_primaries[2].y = display_primaries_blue & 0xffff;
+	hdr_metadata.hdmi_metadata_type1.white_point.x = (white_point >> 16) & 0xffff;
+	hdr_metadata.hdmi_metadata_type1.white_point.y = white_point & 0xffff;
+	hdr_metadata.hdmi_metadata_type1.max_display_mastering_luminance =
+				(mastering_display_luminance >> 16) & 0xffff;
+	hdr_metadata.hdmi_metadata_type1.min_display_mastering_luminance =
+				mastering_display_luminance & 0xffff;
+	hdr_metadata.hdmi_metadata_type1.max_cll = max_cll & 0xffff;
+	hdr_metadata.hdmi_metadata_type1.max_fall = max_fall & 0xffff;
+
+	drmModeCreatePropertyBlob(b->drm->drm.fd, &hdr_metadata, sizeof(hdr_metadata), &b->drm->hdr_blob_id);
+}
+
+static const struct zwp_hdr10_metadata_v1_interface hdr10_metadata_interface = {
+	hdr10_metadata_destroy,
+	hdr10_metadata_set_metadata,
+};
+
+static void
+bind_hdr10_metadata(struct wl_client *client,
+		       void *data, uint32_t version, uint32_t id)
+{
+	struct wl_resource *resource;
+	struct weston_compositor *compositor = data;
+
+	resource = wl_resource_create(client, &zwp_hdr10_metadata_v1_interface,
+				      version, id);
+	if (resource == NULL) {
+		wl_client_post_no_memory(client);
+		return;
+	}
+
+	wl_resource_set_implementation(resource, &hdr10_metadata_interface,
+				       compositor, NULL);
+}
+
+static bool
+drm_backend_is_hdr_supported(struct weston_compositor *compositor)
+{
+	struct drm_output *output;
+	struct drm_head *head;
+
+	wl_list_for_each(output, &compositor->output_list, base.link) {
+		wl_list_for_each(head, &output->base.head_list, base.output_link) {
+			if (head->connector.props[WDRM_CONNECTOR_HDR_OUTPUT_METADATA].prop_id > 0)
+				return true;
+		}
+	}
+
+	wl_list_for_each(output, &compositor->pending_output_list, base.link) {
+		wl_list_for_each(head, &output->base.head_list, base.output_link) {
+			if (head->connector.props[WDRM_CONNECTOR_HDR_OUTPUT_METADATA].prop_id > 0)
+				return true;
+		}
+	}
+
+	return true;
+}
+
 static struct drm_backend *
 drm_backend_create(struct weston_compositor *compositor,
 		   struct weston_drm_backend_config *config)
@@ -3984,6 +4236,7 @@ drm_backend_create(struct weston_compositor *compositor,
 	if (device == NULL)
 		goto err_backend;
 	device->state_invalid = true;
+	device->clean_hdr_blob = false;
 	device->drm.fd = -1;
 	device->backend = b;
 	device->gem_handle_refcnt = hash_table_create();
@@ -3994,6 +4247,12 @@ drm_backend_create(struct weston_compositor *compositor,
 	wl_list_init(&b->kms_list);
 
 	b->compositor = compositor;
+#if defined(ENABLE_IMXG2D)
+	b->use_g2d = config->use_g2d;
+#endif
+	b->enable_overlay_view = config->enable_overlay_view;
+	b->shell_width = config->shell_width;
+	b->shell_height = config->shell_height;
 	b->pageflip_timeout = config->pageflip_timeout;
 	b->use_pixman_shadow = config->use_pixman_shadow;
 	b->has_underlay = false;
@@ -4050,6 +4309,10 @@ drm_backend_create(struct weston_compositor *compositor,
 #else
 		config->renderer = WESTON_RENDERER_PIXMAN;
 #endif
+#if defined(ENABLE_IMXG2D)
+	if (b->use_g2d)
+		config->renderer = WESTON_RENDERER_G2D;
+#endif
 	}
 
 	switch (config->renderer) {
@@ -4065,6 +4328,14 @@ drm_backend_create(struct weston_compositor *compositor,
 			goto err_udev_dev;
 		}
 		break;
+#if defined(ENABLE_IMXG2D)
+	case WESTON_RENDERER_G2D:
+		if (init_g2d(b) < 0) {
+			weston_log("failed to initialize g2d renderer\n");
+			goto err_udev_dev;
+		}
+		break;
+#endif
 	default:
 		weston_log("unsupported renderer for DRM backend\n");
 		goto err_udev_dev;
@@ -4078,6 +4349,10 @@ drm_backend_create(struct weston_compositor *compositor,
 	b->base.create_output = drm_output_create;
 	b->base.device_changed = drm_device_changed;
 	b->base.can_scanout_dmabuf = drm_can_scanout_dmabuf;
+	b->base.get_supported_formats = drm_get_supported_formats;
+	b->base.import_dmabuf = drm_import_dmabuf;
+
+	weston_drm_format_array_init(&b->supported_formats);
 
 	weston_setup_vt_switch_bindings(compositor);
 
@@ -4095,12 +4370,14 @@ drm_backend_create(struct weston_compositor *compositor,
 
 	wl_list_init(&device->plane_list);
 	create_sprites(b->drm);
+	ret = populate_supported_formats(b);
+	if (ret < 0)
+		goto err_sprite;
 
 	if (udev_input_init(&b->input,
 			    compositor, b->udev, seat_id,
 			    config->configure_device) < 0) {
 		weston_log("failed to create input devices\n");
-		goto err_sprite;
 	}
 
 	wl_list_init(&b->drm->writeback_connector_list);
@@ -4185,6 +4462,15 @@ drm_backend_create(struct weston_compositor *compositor,
 			weston_log("Error: initializing content-protection "
 				   "support failed.\n");
 
+	if (drm_backend_is_hdr_supported(compositor)) {
+		if (!wl_global_create(compositor->wl_display, &zwp_hdr10_metadata_v1_interface, 1,
+				      compositor, bind_hdr10_metadata)) {
+			weston_log("Error: initializing hdr10 support failed\n");
+		}
+	} else {
+		weston_log("info: HDR is not support\n");
+	}
+
 	ret = weston_plugin_api_register(compositor, WESTON_DRM_OUTPUT_API_NAME,
 					 &api, sizeof(api));
 
@@ -4199,6 +4485,19 @@ drm_backend_create(struct weston_compositor *compositor,
 		goto err_udev_monitor;
 	}
 
+	if(b->enable_overlay_view){
+		/* create enable-overlay-view*/
+		char *dir, *path;
+		mode_t mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;
+
+		dir = getenv("XDG_RUNTIME_DIR");
+		path = malloc(strlen(dir) + 40);
+		strcpy(path, dir);
+		strcat(path, "/enable-overlay-view");
+		close(open(path, O_CREAT | O_RDWR, mode));
+		free(path);
+	}
+
 	return b;
 
 err_udev_monitor:
@@ -4209,6 +4508,7 @@ err_drm_source:
 err_udev_input:
 	udev_input_destroy(&b->input);
 err_sprite:
+	weston_drm_format_array_fini(&b->supported_formats);
 	destroy_sprites(b->drm);
 err_create_crtc_list:
 	drmModeFreeResources(res);
@@ -4237,6 +4537,16 @@ config_init_to_defaults(struct weston_drm_backend_config *config)
 {
 	config->renderer = WESTON_RENDERER_AUTO;
 	config->use_pixman_shadow = true;
+#if defined(ENABLE_IMXG2D)
+#if !defined(BUILD_DRM_GBM)
+	config->use_g2d = true;
+#else
+	config->use_g2d = false;
+#endif
+#endif
+	config->shell_width = 0;
+	config->shell_height = 0;
+	config->enable_overlay_view = 0;
 }
 
 WL_EXPORT int

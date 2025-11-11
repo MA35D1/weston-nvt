@@ -42,6 +42,10 @@
 #include <sys/mman.h>
 #include <time.h>
 
+#if defined(ENABLE_IMXG2D)
+#include <g2dExt.h>
+#include "renderer-g2d/g2d-renderer.h"
+#endif
 
 #include <xf86drm.h>
 #include <xf86drmMode.h>
@@ -77,6 +81,8 @@
 #ifndef DRM_PLANE_ALPHA_OPAQUE
 #define DRM_PLANE_ALPHA_OPAQUE	0xffffUL
 #endif
+
+#define ALIGNTO(a, b) ((a + (b-1)) & (~(b-1)))
 
 /**
  * A small wrapper to print information into the 'drm-backend' debug scope.
@@ -223,6 +229,10 @@ struct drm_device {
 
 	bool fb_modifiers;
 
+	/* hdr10 metadata blob id */
+	unsigned int hdr_blob_id;
+	bool clean_hdr_blob;
+
 	/* we need these parameters in order to not fail drmModeAddFB2()
 	 * due to out of bounds dimensions, and then mistakenly set
 	 * sprites_are_broken:
@@ -251,7 +261,16 @@ struct drm_backend {
 	struct wl_listener session_listener;
 	const struct pixel_format_info *format;
 
+#if defined(ENABLE_IMXG2D)
+	bool use_g2d;
+	struct g2d_renderer_interface *g2d_renderer;;
+#endif
+
 	bool use_pixman_shadow;
+
+	bool enable_overlay_view;
+	uint32_t shell_width;
+	uint32_t shell_height;
 
 	struct udev_input input;
 
@@ -261,6 +280,8 @@ struct drm_backend {
 	bool has_underlay;
 
 	struct weston_log_scope *debug;
+
+	struct weston_drm_format_array supported_formats;
 };
 
 struct drm_mode {
@@ -304,6 +325,8 @@ struct drm_fb {
 
 	/* Used by dumb fbs */
 	void *map;
+
+	uint64_t dtrc_meta;
 };
 
 struct drm_buffer_fb {
@@ -419,6 +442,8 @@ struct drm_plane {
 	struct drm_property_info props[WDRM_PLANE__COUNT];
 	/* True if the plane's zpos_max < primary plane's zpos_min. */
 	bool is_underlay;
+
+	uint64_t dtrc_meta;
 
 	/* The last state submitted to the kernel for this plane. */
 	struct drm_plane_state *state_cur;
@@ -572,9 +597,14 @@ struct drm_output {
 	/* only set when a writeback screenshot is ongoing */
 	struct drm_writeback_state *wb_state;
 
-	struct drm_fb *dumb[2];
-	struct weston_renderbuffer *renderbuffer[2];
+	struct drm_fb *dumb[3];
+	struct weston_renderbuffer *renderbuffer[3];
+#if defined(ENABLE_IMXG2D)
+	struct g2d_surfaceEx g2d_image[3];
+	int dumb_dmafd[3];
+#endif
 	int current_image;
+	pixman_region32_t previous_damage;
 
 	struct vaapi_recorder *recorder;
 	struct wl_listener recorder_frame_listener;
@@ -587,6 +617,8 @@ struct drm_output {
 	submit_frame_cb virtual_submit_frame;
 
 	enum wdrm_content_type content_type;
+
+	int (*surface_get_in_fence_fd)(struct gbm_surface *surface);
 };
 
 void
@@ -892,6 +924,22 @@ drm_output_fini_egl(struct drm_output *output);
 
 struct drm_fb *
 drm_output_render_gl(struct drm_output_state *state, pixman_region32_t *damage);
+#if defined(ENABLE_IMXG2D)
+int
+init_g2d(struct drm_backend *b);
+
+int
+drm_output_init_g2d(struct drm_output *output, struct drm_backend *b);
+
+void
+drm_output_fini_g2d(struct drm_output *output);
+
+struct drm_fb *
+drm_output_render_g2d(struct drm_output_state *state, pixman_region32_t *damage);
+#endif
+
+int
+drm_fb_get_gbm_alignment(struct drm_fb *fb);
 
 #else
 inline static int
