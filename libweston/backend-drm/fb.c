@@ -225,10 +225,13 @@ drm_fb_addfb(struct drm_device *device, struct drm_fb *fb)
 		 * for all planes. */
 		for (i = 0; i < ARRAY_LENGTH(mods) && fb->handles[i]; i++)
 			mods[i] = fb->modifier;
+#if 0 //schung
 		if (fb->modifier == DRM_FORMAT_MOD_AMPHION_TILED) {
 			width = ALIGNTO (fb->width, 8);
 			height = ALIGNTO (fb->height, 256);
-		}else if(fb->modifier ==DRM_FORMAT_MOD_VIVANTE_SUPER_TILED){
+		}else
+#endif
+		if(fb->modifier ==DRM_FORMAT_MOD_VIVANTE_SUPER_TILED){
 			width = ALIGNTO (fb->width, 64);
 			height = ALIGNTO (fb->height, 64);
 		} else {
@@ -389,7 +392,9 @@ drm_fb_get_gbm_alignment(struct drm_fb *fb)
 
 	if (fb){
 		switch(fb->modifier) {
+#if 0 //schung
 			case DRM_FORMAT_MOD_VIVANTE_SUPER_TILED_FC:
+#endif
 			case DRM_FORMAT_MOD_VIVANTE_SUPER_TILED:
 				gbm_aligned = 64;
 			break;

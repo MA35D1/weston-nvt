@@ -62,13 +62,17 @@ deps_drm = [
 	dep_backlight
 ]
 
+config_h.set('ENABLE_IMXG2D', '1') #schung
+
 if get_option('renderer-gl')
 	if not dep_gbm.found()
 		error('drm-backend with GL renderer requires gbm which was not found. Or, you can use \'-Drenderer-gl=false\'.')
 	endif
 	deps_drm += dep_gbm
 	srcs_drm += 'drm-gbm.c'
-	config_h.set('BUILD_DRM_GBM', '1')
+	config_h.set('BUILD_DRM_GBM', '0') #schung
+	#config_h.set('BUILD_DRM_GBM', '1') #orig
+		
 endif
 
 if get_option('backend-drm-screencast-vaapi')

@@ -1766,10 +1766,13 @@ g2d_renderer_attach_dmabuf(struct weston_surface *es, struct  weston_buffer *buf
 	gs->g2d_surface.base.width	= buffer->width;
 	gs->g2d_surface.base.height = buffer->height;
 	gs->g2d_surface.base.rot	= G2D_ROTATION_0;
+#if 0 //schung
 	if (dmabuf->attributes.modifier == DRM_FORMAT_MOD_AMPHION_TILED) {
 		gs->g2d_surface.base.stride = dmabuf->attributes.stride[0];
 		gs->g2d_surface.tiling = G2D_AMPHION_TILED;
-	} else if(dmabuf->attributes.modifier == DRM_FORMAT_MOD_VIVANTE_SUPER_TILED ||
+	} else
+#endif
+	if(dmabuf->attributes.modifier == DRM_FORMAT_MOD_VIVANTE_SUPER_TILED ||
 		      dmabuf->attributes.modifier == DRM_FORMAT_MOD_VIVANTE_SPLIT_SUPER_TILED){
 		gs->g2d_surface.base.stride = alignedWidth;
 		gs->g2d_surface.tiling = G2D_SUPERTILED;
@@ -1805,9 +1808,10 @@ g2d_renderer_query_dmabuf_formats(struct weston_compositor *wc,
 		DRM_FORMAT_BGRX8888,
 		DRM_FORMAT_RGBX8888,
 	};
-
+#if 0
 	g2d_query_hardware(gr->handle, G2D_HARDWARE_PXP_V1, &hardware_v1_available);
 	g2d_query_hardware(gr->handle, G2D_HARDWARE_PXP_V2, &hardware_v2_available);
+#endif
 	if(hardware_v1_available == 1) {
 		g2d_offset = 6;
 	}
@@ -1962,7 +1966,7 @@ populate_supported_formats(struct weston_compositor *ec,
 				continue;
 			/* Only add 2D supported modifiers. */
 			if (modifiers[j] == DRM_FORMAT_MOD_LINEAR ||
-			    modifiers[j] == DRM_FORMAT_MOD_AMPHION_TILED ||
+			    // modifiers[j] == DRM_FORMAT_MOD_AMPHION_TILED || //schung
 			    modifiers[j] == DRM_FORMAT_MOD_VIVANTE_SUPER_TILED ||
 			    modifiers[j] == DRM_FORMAT_MOD_VIVANTE_SPLIT_SUPER_TILED) {
 				ret = weston_drm_format_add_modifier(fmt, modifiers[j]);
@@ -2374,10 +2378,10 @@ g2d_renderer_create(struct weston_compositor *ec)
 	ec->capabilities |= WESTON_CAP_ROTATION_ANY;
 	ec->capabilities |= WESTON_CAP_CAPTURE_YFLIP;
 	ec->capabilities |= WESTON_CAP_VIEW_CLIP_MASK;
-
+#if 0
 	g2d_query_hardware(gr->handle, G2D_HARDWARE_PXP_V1, &hardware_v1_available);
 	g2d_query_hardware(gr->handle, G2D_HARDWARE_PXP_V2, &hardware_v2_available);
-
+#endif
 	/* Configure read format to PIXMAN_x8r8g8b8 for pxp device */
 	if (hardware_v1_available == 1) {
 		ec->read_format = pixel_format_get_info_by_pixman(PIXMAN_x8r8g8b8);
