@@ -1755,9 +1755,11 @@ g2d_renderer_attach_dmabuf(struct weston_surface *es, struct  weston_buffer *buf
 		return;
 
 	paddr = (unsigned int *)linux_dmabuf_buffer_get_user_data(dmabuf);
+#if 0 //schung
 	for (i = 0; i < dmabuf->attributes.n_planes; i++) {
 		gs->g2d_surface.base.planes[i] = paddr[i] + dmabuf->attributes.offset[i];
 	}
+#endif
 
 	gs->g2d_surface.base.left = 0;
 	gs->g2d_surface.base.top  = 0;
@@ -1766,13 +1768,10 @@ g2d_renderer_attach_dmabuf(struct weston_surface *es, struct  weston_buffer *buf
 	gs->g2d_surface.base.width	= buffer->width;
 	gs->g2d_surface.base.height = buffer->height;
 	gs->g2d_surface.base.rot	= G2D_ROTATION_0;
-#if 0 //schung
 	if (dmabuf->attributes.modifier == DRM_FORMAT_MOD_AMPHION_TILED) {
 		gs->g2d_surface.base.stride = dmabuf->attributes.stride[0];
 		gs->g2d_surface.tiling = G2D_AMPHION_TILED;
-	} else
-#endif
-	if(dmabuf->attributes.modifier == DRM_FORMAT_MOD_VIVANTE_SUPER_TILED ||
+	} else if(dmabuf->attributes.modifier == DRM_FORMAT_MOD_VIVANTE_SUPER_TILED ||
 		      dmabuf->attributes.modifier == DRM_FORMAT_MOD_VIVANTE_SPLIT_SUPER_TILED){
 		gs->g2d_surface.base.stride = alignedWidth;
 		gs->g2d_surface.tiling = G2D_SUPERTILED;
@@ -1966,7 +1965,7 @@ populate_supported_formats(struct weston_compositor *ec,
 				continue;
 			/* Only add 2D supported modifiers. */
 			if (modifiers[j] == DRM_FORMAT_MOD_LINEAR ||
-			    // modifiers[j] == DRM_FORMAT_MOD_AMPHION_TILED || //schung
+			    modifiers[j] == DRM_FORMAT_MOD_AMPHION_TILED ||
 			    modifiers[j] == DRM_FORMAT_MOD_VIVANTE_SUPER_TILED ||
 			    modifiers[j] == DRM_FORMAT_MOD_VIVANTE_SPLIT_SUPER_TILED) {
 				ret = weston_drm_format_add_modifier(fmt, modifiers[j]);
